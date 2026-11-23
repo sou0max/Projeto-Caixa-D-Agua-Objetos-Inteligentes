@@ -1,0 +1,201 @@
+[
+    {
+        "id": "8faf8f79d0b87dc4",
+        "type": "tab",
+        "label": "Objetos Inteligentes",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "238dc14e67b8d4ca",
+        "type": "mqtt in",
+        "z": "8faf8f79d0b87dc4",
+        "name": "",
+        "topic": "reservatorios/+/+/nivel",
+        "qos": "2",
+        "datatype": "auto-detect",
+        "broker": "c5546c2be579f380",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 200,
+        "y": 80,
+        "wires": [
+            [
+                "30a443e560f37425"
+            ]
+        ]
+    },
+    {
+        "id": "30a443e560f37425",
+        "type": "json",
+        "z": "8faf8f79d0b87dc4",
+        "name": "",
+        "property": "payload",
+        "action": "obj",
+        "pretty": false,
+        "x": 390,
+        "y": 80,
+        "wires": [
+            [
+                "4b334ba3b20230d5"
+            ]
+        ]
+    },
+    {
+        "id": "4b334ba3b20230d5",
+        "type": "function",
+        "z": "8faf8f79d0b87dc4",
+        "name": "function 1",
+        "func": "const data = msg.payload;\nif (!data || data.nivel_pct === undefined) return null;\n\nconst localId = data.local_id || \"bloco_a\";\nconst caixaId = data.caixa_id || \"caixa_01\";\nconst chave = `${localId}_${caixaId}`;\nconst baseTopico = `reservatorios/${localId}/${caixaId}`;\n\nconst nivel = Number(data.nivel_pct);\nconst volume = Number(data.volume_l || 0);\nconst distancia = Number(data.distancia_cm || 0);\nconst bombaLigada = Boolean(data.bomba_ligada);\nconst agora = Date.now();\nconst horaAtual = new Date(agora).getHours(); // 0..23\n\n// Credenciais (lembre-se de trocar por valores fictícios antes de subir para o GitHub)\nconst CALLMEBOT_USER = \"@maxzin1506\";\nconst INFLUX_URL     = \"https://us-east-1-1.aws.cloud2.influxdata.com\";\nconst INFLUX_ORG     = \"a3e7c6a1f7841a0e\";\nconst INFLUX_BUCKET  = \"ObjetosInteligentes\";\nconst INFLUX_TOKEN   = \"LdWmLnJtjUsB5n_NDXBiDBS15VpYHylKIG2dLzPXutpdcCHQPITRCESyfwkfJQKzFEv_E_2FWf0B_Sxscx2LJg==\";\n\nlet estados = flow.get(\"estadosCaixas\") || {};\nif (!estados[chave]) {\n  estados[chave] = {\n    historicoNivel: [],\n    ultimoAlerta: {},\n    ultimaMsgTs: agora\n  };\n}\nconst st = estados[chave];\nst.ultimaMsgTs = agora;\n\n// Histórico de até 65 minutos para avaliar queda >= 5% em 60 min\nst.historicoNivel.push({ ts: agora, nivel });\nst.historicoNivel = st.historicoNivel.filter(item => agora - item.ts <= 65 * 60 * 1000);\n\nconst COOLDOWN_MS = 15 * 60 * 1000;\nfunction podeAlertar(regra) {\n  const ult = st.ultimoAlerta[regra] || 0;\n  if (agora - ult >= COOLDOWN_MS) {\n    st.ultimoAlerta[regra] = agora;\n    return true;\n  }\n  return false;\n}\n\nfunction montarMsgTelegram(texto) {\n  const user = encodeURIComponent(CALLMEBOT_USER);\n  const msgEncoded = encodeURIComponent(texto);\n  return {\n    url: `https://api.callmebot.com/text.php?user=${user}&text=${msgEncoded}`\n  };\n}\n\nlet outMqtt = null;\nlet outTelegram = null;\nlet alertaTexto = null;\nlet eventoTipo = \"normal\";\n\n// 1. Nível <= 20% com bomba desligada -> liga bomba\nif (nivel <= 20 && !bombaLigada) {\n  outMqtt = { topic: `${baseTopico}/bomba/cmd`, payload: \"ON\" };\n  eventoTipo = \"nivel_baixo_bomba_on\";\n  if (podeAlertar(\"nivel_baixo\")) {\n    alertaTexto = `[${localId}/${caixaId}] Nível baixo (${nivel.toFixed(1)}%, ${volume.toFixed(0)}L). Bomba ligada (ON).`;\n  }\n}\n\n// 2. Nível >= 95% com bomba ligada -> desliga bomba\nif (nivel >= 95 && bombaLigada) {\n  outMqtt = { topic: `${baseTopico}/bomba/cmd`, payload: \"OFF\" };\n  eventoTipo = \"cheio_bomba_off_transbordo_evitado\";\n  if (podeAlertar(\"nivel_cheio\")) {\n    alertaTexto = `[${localId}/${caixaId}] Reservatório cheio (${nivel.toFixed(1)}%). Bomba desligada (OFF) — transbordamento evitado.`;\n  }\n}\n\n// 3. Risco de transbordo (> 98%) -> aciona alarme\nif (nivel > 98) {\n  outMqtt = { topic: `${baseTopico}/alarme`, payload: \"ON\" };\n  eventoTipo = \"risco_transbordo\";\n  if (podeAlertar(\"transbordo\")) {\n    alertaTexto = `[ALERTA CRÍTICO - ${localId}/${caixaId}] Risco de transbordo! Nível em ${nivel.toFixed(1)}%. Verifique possível falha no relé/acionamento.`;\n  }\n}\n\n// 4. Possível vazamento entre 0h e 5h, bomba desligada, queda >= 5% em 60 min\nconst leitura1hAtras = st.historicoNivel.find(item => agora - item.ts >= 55 * 60 * 1000);\nif (horaAtual >= 0 && horaAtual < 5 && !bombaLigada && leitura1hAtras) {\n  const queda = leitura1hAtras.nivel - nivel;\n  if (queda >= 5) {\n    eventoTipo = \"possivel_vazamento\";\n    if (podeAlertar(\"vazamento\")) {\n      alertaTexto = `Possível vazamento: queda de ${queda.toFixed(1)}% em 1 h com a bomba desligada. Nível: ${nivel.toFixed(1)}% (${localId}/${caixaId}).`;\n    }\n  }\n}\n\nif (alertaTexto) {\n  outTelegram = montarMsgTelegram(alertaTexto);\n}\n\nflow.set(\"estadosCaixas\", estados);\n\n// Saída 3: Envio direto via API HTTP v2 do InfluxDB Cloud (Line Protocol)\nconst linhaInflux = `telemetria_reservatorio,local_id=${localId},caixa_id=${caixaId},evento=${eventoTipo} nivel_pct=${nivel},volume_l=${volume},distancia_cm=${distancia},bomba_ligada=${bombaLigada ? 1 : 0}i,alerta_disparado=${alertaTexto ? 1 : 0}i`;\n\nconst outInflux = {\n  method: \"POST\",\n  url: `${INFLUX_URL}/api/v2/write?org=${encodeURIComponent(INFLUX_ORG)}&bucket=${encodeURIComponent(INFLUX_BUCKET)}&precision=s`,\n  headers: {\n    \"Authorization\": `Token ${INFLUX_TOKEN}`,\n    \"Content-Type\": \"text/plain; charset=utf-8\"\n  },\n  payload: linhaInflux\n};\n\nreturn [outMqtt, outTelegram, outInflux];",
+        "outputs": 3,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 540,
+        "y": 100,
+        "wires": [
+            [
+                "f2f74e7c8ce7eb38"
+            ],
+            [
+                "d8722c6ca0b1f153"
+            ],
+            [
+                "4fe0cdc15f67d597",
+                "a78d799ea63aa7f1"
+            ]
+        ]
+    },
+    {
+        "id": "f2f74e7c8ce7eb38",
+        "type": "mqtt out",
+        "z": "8faf8f79d0b87dc4",
+        "name": "",
+        "topic": "",
+        "qos": "",
+        "retain": "",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "c5546c2be579f380",
+        "x": 450,
+        "y": 220,
+        "wires": []
+    },
+    {
+        "id": "d8722c6ca0b1f153",
+        "type": "http request",
+        "z": "8faf8f79d0b87dc4",
+        "name": "",
+        "method": "GET",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 450,
+        "y": 280,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "4fe0cdc15f67d597",
+        "type": "debug",
+        "z": "8faf8f79d0b87dc4",
+        "name": "debug 1",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 240,
+        "y": 220,
+        "wires": []
+    },
+    {
+        "id": "a78d799ea63aa7f1",
+        "type": "http request",
+        "z": "8faf8f79d0b87dc4",
+        "name": "",
+        "method": "use",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 490,
+        "y": 420,
+        "wires": [
+            [
+                "f1c5e53abd4cedb5"
+            ]
+        ]
+    },
+    {
+        "id": "f1c5e53abd4cedb5",
+        "type": "debug",
+        "z": "8faf8f79d0b87dc4",
+        "name": "debug 2",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 680,
+        "y": 460,
+        "wires": []
+    },
+    {
+        "id": "c5546c2be579f380",
+        "type": "mqtt-broker",
+        "name": "",
+        "broker": "broker.hivemq.com",
+        "port": 1883,
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    }
+]
