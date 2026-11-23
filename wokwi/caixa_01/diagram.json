@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "author": "Max Martins Alvarez & Henrique Totti",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0 },
+    { "type": "wokwi-potentiometer", "id": "pot1", "top": -60, "left": 180 }
+  ],
+  "connections": [
+    [ "esp:TX", "$serial:RX", "", [] ],
+    [ "esp:RX", "$serial:TX", "", [] ],
+    [ "esp:3V3", "pot1:VCC", "red", [ "h50", "v-30" ] ],
+    [ "esp:GND.1", "pot1:GND", "black", [ "h60", "v-20" ] ],
+    [ "esp:D34", "pot1:SIG", "green", [ "h-20", "v-70", "h210" ] ]
+  ]
+}
